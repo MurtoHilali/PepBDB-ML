@@ -12,6 +12,7 @@ from ast import literal_eval
 import tempfile
 from paths import *
 from typing import List
+import warnings
 
 def extract_sequence(pdb_filename: str) -> str:
     '''
@@ -20,15 +21,21 @@ def extract_sequence(pdb_filename: str) -> str:
     parser = PDBParser()
     structure = parser.get_structure('X', pdb_filename)
     
+    sequence = ''
+    contains_unk = False
+    
     for model in structure:
         for chain in model:
             residues = chain.get_residues()
-            sequence = ''
             for residue in residues:
                 if residue.get_resname() == 'HOH': # ignoring water
                     continue
-                sequence += seq1(residue.get_resname()) # seq1 converts 3-letter code to 1-letter code
-            return sequence
+                if residue.get_resname() == 'UNK':
+                    sequence += 'X'  # add three 'X's for each 'UNK' residue
+                else:
+                    sequence += seq1(residue.get_resname()) # seq1 converts 3-letter code to 1-letter code
+
+    return sequence
 
 def label_residues(peptide_path: str, protein_path: str) -> List:
     # Creating a temporary file with the peptide and protein
@@ -40,8 +47,13 @@ def label_residues(peptide_path: str, protein_path: str) -> List:
     temp_file.close()
     
     # Obtaining binding residues using PRODIGY
-    subprocess.run(['prodigy', '-q', '--contact_list', output_path])
-
+    ##subprocess.run(['prodigy', '-q', '--contact_list', output_path])
+    try:
+        subprocess.run(['prodigy', '-q', '--contact_list', output_path], check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"An error occurred while processing the files: {peptide_path} & {protein_path}")
+        print(f"Error: {e}")
+    
     # The .ic file will have the same root name as the input file
     ic_file_path = output_path.replace('.pdb', '.ic')
 
@@ -63,21 +75,24 @@ def hse_and_dssp(pdb_file: str):
     '''
     Get the HSE and DSSP codes of a PDB's residues.
     '''
-    # Initialize PDBParser
-    pdb_parser = PDBParser()
-    structure = pdb_parser.get_structure('structure', pdb_file)
-    
-    hse = HSExposure.HSExposureCA(structure)
-    dssp = DSSP(structure[0], pdb_file)
-    
-    # Half-sphere exposure values
-    hse_up, hse_down, pseudo_angle = zip(*[(res[1][0], res[1][1], res[1][2]) for res in hse.property_list])
-   
-    # Extract DSSP values into separate lists
-    ss, asa, phi, psi = zip(*[(res[2], res[3], res[4], res[5]) for res in dssp.property_list])
-    
-    print(f'\rData acquired for {pdb_file}')
-    return hse_up, hse_down, pseudo_angle, ss, asa, phi, psi
+    with warnings.catch_warnings():
+        warnings.simplefilter(action='ignore', category=FutureWarning)
+        
+        # Initialize PDBParser
+        pdb_parser = PDBParser()
+        structure = pdb_parser.get_structure('structure', pdb_file)
+        
+        hse = HSExposure.HSExposureCA(structure)
+        dssp = DSSP(structure[0], pdb_file)
+        
+        # Half-sphere exposure values
+        hse_up, hse_down, pseudo_angle = zip(*[(res[1][0], res[1][1], res[1][2]) for res in hse.property_list])
+       
+        # Extract DSSP values into separate lists
+        ss, asa, phi, psi = zip(*[(res[2], res[3], res[4], res[5]) for res in dssp.property_list])
+        
+        print(f'\rData acquired for {pdb_file}')
+        return hse_up, hse_down, pseudo_angle, ss, asa, phi, psi
 
 def safe_hse_and_dssp(pdb_file):
     '''
@@ -136,7 +151,12 @@ def get_pssm_profile(sequence: str) -> pd.DataFrame:
     os.close(pssm_fd)
 
     try:
-        subprocess.run(f'psiblast -query {fasta_path} -db {swissprot} -num_iterations 3 -evalue 0.001 -out_ascii_pssm {pssm_path} 2>/dev/null', shell=True, check=True)
+        subprocess.run(
+            ['psiblast', '-query', fasta_path, '-db', swissprot, '-num_iterations', '3', '-evalue', '0.001', '-out_ascii_pssm', pssm_path],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=True
+        )
         
         with open(pssm_path, 'r') as file:
             lines = file.readlines()
@@ -161,7 +181,6 @@ def make_tabular_dataset(row: pd.Series) -> pd.DataFrame:
     '''
     `make_tabular_dataset` is designed to be applied to a row of the input DataFrame
     to create a feature array.
-    
     '''
     feature_dict = row.to_dict()
     
@@ -170,8 +189,8 @@ def make_tabular_dataset(row: pd.Series) -> pd.DataFrame:
     pssm = feature_dict[f'Protein PSSM']
     
     # remove the first row of the PSSM, which is the sequence
-    pssm = pssm.reset_index(drop=True)
     pssm = pssm.iloc[1:]
+    pssm = pssm.values
     
     # get the binding indices list
     binding_indices_dummy = [0] * len(sequence)
@@ -199,16 +218,14 @@ def make_tabular_dataset(row: pd.Series) -> pd.DataFrame:
                 use_feature_dict[k] = literal_eval(str(v))
             except (ValueError, SyntaxError) as e:
                 print(f"Error parsing key '{k}' with value '{v}': {e}")
-
-    for key, value in use_feature_dict.items():
+                
+    # stack all the features
+    for _, value in use_feature_dict.items():
         value_array = [residue_value for residue_value in value]
         arr.append(value_array) # add the feature to the array
-    
-    # stack the arrays on top of each other
-    try:
-        arr = pd.DataFrame(np.vstack((arr, pssm, binding_indices_dummy)))
-    except ValueError as e:
-        print("An error occurred:", e)
+    for aa_row in pssm:
+        arr.append(aa_row)
+    arr.append(binding_indices_dummy)
     
     # transpose the array and add the column names
     arr = pd.DataFrame(arr).T
